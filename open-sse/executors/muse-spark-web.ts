@@ -35,9 +35,11 @@ const META_WS_TIER = "prod";
 const META_WS_INTRO_FRAME_TYPE = 0x0f;
 const META_WS_PROMPT_FRAME_TYPE = 0x0d;
 const META_WS_PROMPT_FRAME_FLAG = 0x80;
+const META_WS_INITIAL_TIMEOUT_MS = 30_000;
+const META_WS_RESPONSE_IDLE_MS = 5_000;
 const META_AI_ROOT_BRANCH_PATH = "0";
 const META_AI_USER_AGENT =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
 const BASE62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 type MuseSparkModelInfo = {
@@ -653,27 +655,29 @@ type ProtoField = {
   value: Uint8Array | number | bigint;
 };
 
-function encodeVarint(value: number): Uint8Array {
+function encodeVarint(value: number | bigint): Uint8Array {
   const out: number[] = [];
-  let v = value >>> 0;
-  while (v >= 0x80) {
-    out.push((v & 0x7f) | 0x80);
-    v >>>= 7;
+  let v = BigInt(value);
+  if (v < 0n) throw new Error("Varints must be non-negative");
+  while (v >= 0x80n) {
+    out.push(Number(v & 0x7fn) | 0x80);
+    v >>= 7n;
   }
-  out.push(v & 0x7f);
+  out.push(Number(v & 0x7fn));
   return new Uint8Array(out);
 }
 
-function decodeVarint(data: Uint8Array, offset: number): [number, number] {
-  let shift = 0;
-  let value = 0;
+function decodeVarint(data: Uint8Array, offset: number): [bigint, number] {
+  let shift = 0n;
+  let value = 0n;
   let off = offset;
   while (true) {
+    if (off >= data.length) throw new Error("Truncated varint");
     const byte = data[off++];
-    value |= (byte & 0x7f) << shift;
-    if (!(byte & 0x80)) return [value >>> 0, off];
-    shift += 7;
-    if (shift > 63) throw new Error("Varint too long");
+    value |= BigInt(byte & 0x7f) << shift;
+    if (!(byte & 0x80)) return [value, off];
+    shift += 7n;
+    if (shift > 70n) throw new Error("Varint too long");
   }
 }
 
@@ -681,8 +685,9 @@ function parseProtoFields(data: Uint8Array): ProtoField[] {
   const fields: ProtoField[] = [];
   let offset = 0;
   while (offset < data.length) {
-    const [tag, next] = decodeVarint(data, offset);
+    const [rawTag, next] = decodeVarint(data, offset);
     offset = next;
+    const tag = Number(rawTag);
     const number = tag >> 3;
     const wireType = tag & 0x07;
     if (wireType === 0) {
@@ -694,8 +699,10 @@ function parseProtoFields(data: Uint8Array): ProtoField[] {
       fields.push({ number, wireType, value: view.getBigUint64(0, true) });
       offset += 8;
     } else if (wireType === 2) {
-      const [len, n] = decodeVarint(data, offset);
+      const [rawLen, n] = decodeVarint(data, offset);
       offset = n;
+      const len = Number(rawLen);
+      if (!Number.isSafeInteger(len)) throw new Error("Protobuf field length is too large");
       fields.push({ number, wireType, value: data.slice(offset, offset + len) });
       offset += len;
     } else if (wireType === 5) {
@@ -715,7 +722,7 @@ function serializeProtoFields(fields: ProtoField[]): Uint8Array {
     const tag = (f.number << 3) | f.wireType;
     parts.push(encodeVarint(tag));
     if (f.wireType === 0) {
-      parts.push(encodeVarint(Number(f.value)));
+      parts.push(encodeVarint(f.value as number | bigint));
     } else if (f.wireType === 1) {
       const buf = new Uint8Array(8);
       new DataView(buf.buffer).setBigUint64(0, BigInt(f.value), true);
@@ -799,26 +806,39 @@ function buildWsPromptFrame(
     requestId?: string;
     userMessageId?: string;
     submittedMs?: number;
-    uniqueMessageId?: number;
+    uniqueMessageId?: number | bigint;
     subSessionIdx?: number;
     messageSeq?: number;
   }
 ): Uint8Array {
   const requestId = opts.requestId || crypto.randomUUID();
   const userMessageId = opts.userMessageId || crypto.randomUUID();
-  const submittedMs = opts.submittedMs || Date.now();
+  const submittedMs = opts.submittedMs ?? Date.now();
   const uniqueMessageId =
-    opts.uniqueMessageId ||
-    Number(`${submittedMs}${crypto.randomUUID().replace(/-/g, "").slice(0, 4)}`);
+    opts.uniqueMessageId ??
+    BigInt(
+      `${submittedMs}${BigInt(`0x${crypto.randomUUID().replace(/-/g, "")}`)
+        .toString(10)
+        .slice(0, 4)}`
+    );
 
   const raw = Buffer.from(opts.templateB64, "base64");
   const protoFields = parseProtoFields(raw);
 
-  // Patch conversationId at [1,1,5]
+  // Patch the trailing conversation UUID at [1,1,5]. The field also has
+  // an opaque prefix that must be preserved.
   traverseAndMutate(protoFields, [1, 1], (f) => {
     const nested = parseProtoFields(f.value instanceof Uint8Array ? f.value : new Uint8Array());
     const field5 = findProtoField(nested, 5);
-    if (field5) field5.value = new TextEncoder().encode(conversationId);
+    if (field5?.value instanceof Uint8Array) {
+      const uuid = new TextEncoder().encode(conversationId);
+      if (uuid.length !== 36 || field5.value.length < uuid.length) {
+        throw new Error("Meta AI WebSocket conversation IDs must be 36-character UUIDs");
+      }
+      const updated = field5.value.slice();
+      updated.set(uuid, updated.length - uuid.length);
+      field5.value = updated;
+    }
     f.value = serializeProtoFields(nested);
   });
   // Patch userMessageId at [2,1,1]
@@ -835,7 +855,7 @@ function buildWsPromptFrame(
     const f2 = findProtoField(nested, 2);
     const f3 = findProtoField(nested, 3);
     if (f1) f1.value = new TextEncoder().encode(conversationId);
-    if (f2) f2.value = submittedMs;
+    if (f2) f2.value = BigInt(submittedMs);
     if (f3) f3.value = uniqueMessageId;
     f.value = serializeProtoFields(nested);
   });
@@ -851,8 +871,8 @@ function buildWsPromptFrame(
     const nested = parseProtoFields(f.value instanceof Uint8Array ? f.value : new Uint8Array());
     const f1 = findProtoField(nested, 1);
     const f3 = findProtoField(nested, 3);
-    if (f1) f1.value = submittedMs + 1;
-    if (f3) f3.value = submittedMs;
+    if (f1) f1.value = BigInt(submittedMs + 1);
+    if (f3) f3.value = BigInt(submittedMs);
     f.value = serializeProtoFields(nested);
   });
   // Patch requestId at [1,6]
@@ -891,6 +911,24 @@ function buildWsPromptFrame(
   frame.set(header);
   frame.set(msgBody, header.length);
   return frame;
+}
+
+/** Test hook for protocol-level regression tests. */
+export function __buildMuseSparkPromptFrameForTesting(options: {
+  prompt: string;
+  conversationId: string;
+  requestId: string;
+  userMessageId: string;
+  submittedMs: number;
+  uniqueMessageId: bigint;
+}): Uint8Array {
+  return buildWsPromptFrame(options.prompt, options.conversationId, {
+    templateB64: META_WS_HOME_TEMPLATE_B64,
+    requestId: options.requestId,
+    userMessageId: options.userMessageId,
+    submittedMs: options.submittedMs,
+    uniqueMessageId: options.uniqueMessageId,
+  });
 }
 
 // ─── WS URL builder + GraphQL helper + b64 helpers ─────────────────────────────
@@ -1034,8 +1072,12 @@ async function wsChat(
   templateB64: string,
   signal?: AbortSignal | null
 ): Promise<WsChatResult> {
-  const requestId = crypto.randomUUID();
-  const wsUrl = buildWsUrl(authorization, requestId);
+  // Meta's gateway treats the WebSocket handshake and prompt as separate
+  // requests. Reusing the connection request ID for the prompt frame opens
+  // the socket successfully but leaves the prompt unanswered until timeout.
+  const connectionRequestId = crypto.randomUUID();
+  const promptRequestId = crypto.randomUUID();
+  const wsUrl = buildWsUrl(authorization, connectionRequestId);
 
   return new Promise((resolve) => {
     const ws = new WebSocketCtor(wsUrl, {
@@ -1066,13 +1108,18 @@ async function wsChat(
 
     const fail = (error: string) => finish({ content: "", deltas: [], error });
 
-    timeout = setTimeout(() => fail("Meta AI WebSocket timed out"), 30000);
+    timeout = setTimeout(() => fail("Meta AI WebSocket timed out"), META_WS_INITIAL_TIMEOUT_MS);
     abortHandler = () => fail("Request aborted");
     signal?.addEventListener("abort", abortHandler, { once: true });
 
     ws.onopen = () => {
       ws.send(buildWsIntroFrame(conversationId));
-      ws.send(buildWsPromptFrame(prompt, conversationId, { templateB64, requestId }));
+      ws.send(
+        buildWsPromptFrame(prompt, conversationId, {
+          templateB64,
+          requestId: promptRequestId,
+        })
+      );
     };
 
     ws.onmessage = (event) => {
@@ -1111,6 +1158,13 @@ async function wsChat(
           }
         }
       }
+      if (accumulatedText) {
+        if (timeout) clearTimeout(timeout);
+        timeout = setTimeout(
+          () => finish({ content: accumulatedText, deltas: contentDeltas }),
+          META_WS_RESPONSE_IDLE_MS
+        );
+      }
     };
 
     ws.onerror = () => fail("Meta AI WebSocket connection error");
@@ -1144,7 +1198,7 @@ function getContinuationCacheKey(
 function getConversationContext(cached: CachedConversation | null): ConversationContext {
   if (!cached) {
     return {
-      conversationId: generateMetaConversationId(),
+      conversationId: crypto.randomUUID(),
       branchPath: META_AI_ROOT_BRANCH_PATH,
       isNewConversation: true,
     };
