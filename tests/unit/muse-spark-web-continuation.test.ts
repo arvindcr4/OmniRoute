@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   MuseSparkWebExecutor,
+  __buildMuseSparkPromptFrameForTesting,
   __resetMuseSparkConversationCacheForTesting,
+  __setMuseSparkResponseIdleMsForTesting,
   __setMuseSparkWebSocketForTesting,
 } from "../../open-sse/executors/muse-spark-web.ts";
 import { WebSocket } from "ws";
@@ -93,17 +96,90 @@ test("muse-spark-web: new conversation sends via WebSocket", async () => {
     const firstFrame = ws.sentData[0];
     assert.ok(firstFrame instanceof Uint8Array, "first frame is binary");
     assert.equal(firstFrame[0], 0x0f, "first frame is intro frame");
+    const intro = JSON.parse(new TextDecoder().decode(firstFrame.slice(6)));
+    const conversationId = intro["x-dgw-app-x-ecto-conversation-id"];
+    assert.match(
+      conversationId,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      "conversation ID is a UUID"
+    );
     // Second frame should be prompt (type 0x0d)
     if (ws.sentData.length >= 2) {
       const secondFrame = ws.sentData[1];
       assert.ok(secondFrame instanceof Uint8Array, "second frame is binary");
       assert.equal(secondFrame[0], 0x0d, "second frame is prompt frame");
+      const promptEnvelope = JSON.parse(new TextDecoder().decode(secondFrame.slice(8)));
+      const connectionRequestId = new URL(ws.url).searchParams.get(
+        "x-dgw-app-clippy-request-id"
+      );
+      assert.notEqual(
+        promptEnvelope["req-id"],
+        connectionRequestId,
+        "connection and prompt request IDs are distinct"
+      );
     }
     // Should get a 200 response with default text when WS returns nothing
     assert.equal(result.response.status, 200);
   } finally {
     globalThis.fetch = originalFetch;
     restore();
+  }
+});
+
+test("muse-spark-web: prompt frame matches the captured Meta protocol", () => {
+  const frame = __buildMuseSparkPromptFrameForTesting({
+    prompt: "Reply with exactly: OK",
+    conversationId: "11111111-2222-4333-8444-555555555555",
+    requestId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    userMessageId: "99999999-8888-4777-8666-555555555555",
+    submittedMs: 1784294000123,
+    uniqueMessageId: 17842940001231234n,
+  });
+
+  assert.equal(frame.byteLength, 1342);
+  assert.equal(
+    createHash("sha256").update(frame).digest("hex"),
+    "fca82ae05464f55af3ac30c19a78614925407ccb487113555618b9f68bd6fa28"
+  );
+});
+
+test("muse-spark-web: completes after response idle when Meta keeps the socket open", async () => {
+  __resetMuseSparkConversationCacheForTesting();
+  const executor = new MuseSparkWebExecutor();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("{}", { status: 200 });
+
+  class NonClosingWs extends MockWebSocket {
+    override send(data: Uint8Array | string) {
+      this.sentData.push(data);
+      if (data instanceof Uint8Array && data[0] === 0x0d) {
+        setTimeout(() => {
+          this.onmessage?.({
+            data: JSON.stringify({
+              type: "full",
+              response: {
+                sections: [{ view_model: { primitive: { text: "pong" } } }],
+              },
+            }),
+          });
+        }, 5);
+      }
+    }
+  }
+
+  const restoreSocket = __setMuseSparkWebSocketForTesting(
+    NonClosingWs as unknown as typeof WebSocket
+  );
+  const restoreIdle = __setMuseSparkResponseIdleMsForTesting(10);
+  try {
+    const result = await executor.execute(makeBaseInput({ connectionId: "conn-idle" }));
+    assert.equal(result.response.status, 200);
+    const body = await result.response.json();
+    assert.equal(body.choices[0].message.content, "pong");
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreIdle();
+    restoreSocket();
   }
 });
 

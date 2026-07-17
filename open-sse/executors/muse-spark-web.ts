@@ -1055,12 +1055,21 @@ type WsChatResult = {
 // ─── WebSocket chat function + test hook ────────────────────────────────────────
 
 let WebSocketCtor: typeof WebSocket = WebSocket;
+let metaWsResponseIdleMs = META_WS_RESPONSE_IDLE_MS;
 
 export function __setMuseSparkWebSocketForTesting(ctor: typeof WebSocket): () => void {
   const previous = WebSocketCtor;
   WebSocketCtor = ctor;
   return () => {
     WebSocketCtor = previous;
+  };
+}
+
+export function __setMuseSparkResponseIdleMsForTesting(milliseconds: number): () => void {
+  const previous = metaWsResponseIdleMs;
+  metaWsResponseIdleMs = milliseconds;
+  return () => {
+    metaWsResponseIdleMs = previous;
   };
 }
 
@@ -1162,7 +1171,7 @@ async function wsChat(
         if (timeout) clearTimeout(timeout);
         timeout = setTimeout(
           () => finish({ content: accumulatedText, deltas: contentDeltas }),
-          META_WS_RESPONSE_IDLE_MS
+          metaWsResponseIdleMs
         );
       }
     };
