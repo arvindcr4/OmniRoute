@@ -56,6 +56,7 @@ import { handleImagen3ImageGeneration } from "./imageGeneration/providers/imagen
 import { handleIdeogramImageGeneration } from "./imageGeneration/providers/ideogram.ts";
 import { handleHaiperImageGeneration } from "./imageGeneration/providers/haiper.ts";
 import { handleLeonardoImageGeneration } from "./imageGeneration/providers/leonardo.ts";
+import { handleFreepikImageGeneration } from "./imageGeneration/providers/freepik.ts";
 import {
   handleChatGptWebImageGeneration,
   extractMarkdownImageUrls,
@@ -515,6 +516,16 @@ export async function handleImageGeneration({
   }
   if (providerConfig.format === "ideogram-image") {
     return handleIdeogramImageGeneration({
+      model,
+      provider,
+      providerConfig,
+      body,
+      credentials,
+      log,
+    });
+  }
+  if (providerConfig.format === "freepik-image") {
+    return handleFreepikImageGeneration({
       model,
       provider,
       providerConfig,
